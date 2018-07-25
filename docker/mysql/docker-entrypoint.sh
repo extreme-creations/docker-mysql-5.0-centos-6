@@ -59,7 +59,7 @@ process_init_file() {
 }
 
 _check_config() {
-	toRun=( "$@" --verbose --help --log-bin-index="$(mktemp -u)" )
+	toRun=( "$@" --verbose --help )
 	if ! errors="$("${toRun[@]}" 2>&1 >/dev/null)"; then
 		cat >&2 <<-EOM
 
@@ -77,7 +77,9 @@ _check_config() {
 # latter only show values present in config files, and not server defaults
 _get_config() {
 	local conf="$1"; shift
-	"$@" --verbose --help --log-bin-index="$(mktemp -u)" 2>/dev/null | awk '$1 == "'"$conf"'" { print $2; exit }'
+	"$@" --verbose --help --log-bin-index="$(mktemp -u)" 2>/dev/null \
+		| awk '$1 == "'"$conf"'" && /^[^ \t]/ { sub(/^[^ \t]+[ \t]+/, ""); print; exit }'
+	# match "datadir      /some/path with/spaces in/it here" but not "--xyz=abc\n     datadir (xyz)"
 }
 
 # allow the container to be started with `--user`
@@ -89,15 +91,13 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" -a "$(id -u)" = '0' ]; then
 	exec gosu mysql "$BASH_SOURCE" "$@"
 fi
 
-echo $wantHelp;
-
 if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 	# still need to check config, container may have started with --user
 	_check_config "$@"
 	# Get config
 	DATADIR="$(_get_config 'datadir' "$@")"
 
-	if [ ! -d "$DATADIR/initialised" ]; then
+	if [ ! -d "$DATADIR/mysql" ]; then
 		file_env 'MYSQL_ROOT_PASSWORD'
 		if [ -z "$MYSQL_ROOT_PASSWORD" -a -z "$MYSQL_ALLOW_EMPTY_PASSWORD" -a -z "$MYSQL_RANDOM_ROOT_PASSWORD" ]; then
 			echo >&2 'error: database is uninitialized and password option is not specified '
@@ -105,8 +105,21 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 			exit 1
 		fi
 
+		mkdir -p "$DATADIR"
+
+		echo 'Initializing database'
+		"$@" --initialize-insecure
+		echo 'Database initialized'
+
+		if command -v mysql_ssl_rsa_setup > /dev/null && [ ! -e "$DATADIR/server-key.pem" ]; then
+			# https://github.com/mysql/mysql-server/blob/23032807537d8dd8ee4ec1c4d40f0633cd4e12f9/packaging/deb-in/extra/mysql-systemd-start#L81-L84
+			echo 'Initializing certificates'
+			mysql_ssl_rsa_setup --datadir="$DATADIR"
+			echo 'Certificates initialized'
+		fi
+
 		SOCKET="$(_get_config 'socket' "$@")"
-		"$@" --skip-networking --basedir=/usr/local/mysql --socket="${SOCKET}" &
+		"$@" --skip-networking --socket="${SOCKET}" &
 		pid="$!"
 
 		mysql=( mysql --protocol=socket -uroot -hlocalhost --socket="${SOCKET}" )
@@ -150,8 +163,7 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 			--  or products like mysql-fabric won't work
 			SET @@SESSION.SQL_LOG_BIN=0;
 
-			DELETE FROM mysql.user WHERE user NOT IN ('mysql.sys', 'mysqlxsys', 'root') OR host NOT IN ('localhost') ;
-			SET PASSWORD FOR 'root'@'localhost'=PASSWORD('${MYSQL_ROOT_PASSWORD}') ;
+			ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}' ;
 			GRANT ALL ON *.* TO 'root'@'localhost' WITH GRANT OPTION ;
 			${rootCreate}
 			DROP DATABASE IF EXISTS test ;
@@ -186,22 +198,18 @@ if [ "$1" = 'mysqld' -a -z "$wantHelp" ]; then
 		done
 
 		if [ ! -z "$MYSQL_ONETIME_PASSWORD" ]; then
-			echo >&2
-			echo >&2 'Sorry, this version of MySQL does not support "PASSWORD EXPIRE" (required for MYSQL_ONETIME_PASSWORD).'
-			echo >&2
+			"${mysql[@]}" <<-EOSQL
+				ALTER USER 'root'@'%' PASSWORD EXPIRE;
+			EOSQL
 		fi
 		if ! kill -s TERM "$pid" || ! wait "$pid"; then
 			echo >&2 'MySQL init process failed.'
 			exit 1
 		fi
 
-		mkdir -p "$DATADIR/initialised"
-
 		echo
 		echo 'MySQL init process done. Ready for start up.'
 		echo
-	else
-		echo >&2 "MySQL dir '$DATADIR/initialised' already exists, skipping setup."
 	fi
 fi
 
